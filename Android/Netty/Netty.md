@@ -393,3 +393,700 @@ static void setAttributes(Channel channel, Entry<AttributeKey<?>, Object>[] attr
 ## 注册selector
 
 创建完后就是要把这些channel注册到轮询器中
+
+```
+initAndRegister 方法中
+ChannelFuture regFuture = this.config().group().register(channel);
+
+会调用到 AbstractChannel.java 中的
+ public final void register(EventLoop eventLoop, final ChannelPromise promise) {
+            ObjectUtil.checkNotNull(eventLoop, "eventLoop");
+            if (AbstractChannel.this.isRegistered()) {
+                promise.setFailure(new IllegalStateException("registered to an event loop 																already"));
+            } else if (!AbstractChannel.this.isCompatible(eventLoop)) {
+                promise.setFailure(new IllegalStateException("incompatible event loop 												type: " + eventLoop.getClass().getName()));
+            } else {
+                AbstractChannel.this.eventLoop = eventLoop;
+                if (eventLoop.inEventLoop()) {
+                    this.register0(promise);
+                } else {
+                    try {
+                        eventLoop.execute(new Runnable() {
+                            public void run() {
+                                AbstractUnsafe.this.register0(promise);
+                            }
+                        });
+                    } catch (Throwable var4) {
+                        AbstractChannel.logger.warn("Force-closing a channel whose registration task was not accepted by an event loop: {}", AbstractChannel.this, var4);
+                        this.closeForcibly();
+                        AbstractChannel.this.closeFuture.setClosed();
+                        this.safeSetFailure(promise, var4);
+                    }
+                }
+
+            }
+        }
+        
+```
+
+![image-20210227152004146](image-20210227152004146.png)
+
+```
+private void register0(ChannelPromise promise) {
+    try {
+        if (!promise.setUncancellable() || !this.ensureOpen(promise)) {
+            return;
+        }
+
+        boolean firstRegistration = this.neverRegistered;
+        AbstractChannel.this.doRegister();
+        this.neverRegistered = false;
+        AbstractChannel.this.registered = true;
+        AbstractChannel.this.pipeline.invokeHandlerAddedIfNeeded();
+        this.safeSetSuccess(promise);
+        AbstractChannel.this.pipeline.fireChannelRegistered();
+        if (AbstractChannel.this.isActive()) {
+            if (firstRegistration) {
+                AbstractChannel.this.pipeline.fireChannelActive();
+            } else if (AbstractChannel.this.config().isAutoRead()) {
+                this.beginRead();
+            }
+        }
+    } catch (Throwable var3) {
+        this.closeForcibly();
+        AbstractChannel.this.closeFuture.setClosed();
+        this.safeSetFailure(promise, var3);
+    }
+
+}
+```
+
+我们这是NIO，所以在AbstractNioChannel中
+
+```
+protected void doRegister() throws Exception {
+    boolean selected = false;
+
+    while(true) {
+        try {
+            this.selectionKey = this.javaChannel().register(this.eventLoop().unwrappedSelector(), 0, this);
+            return;
+        } catch (CancelledKeyException var3) {
+            if (selected) {
+                throw var3;
+            }
+
+            this.eventLoop().selectNow();
+            selected = true;
+        }
+    }
+}
+```
+
+这里的javaChannel()是上面讲到的jdk创建服务端的channel。
+
+调用jdk的register，第二个参数表示关心什么事件，0表示不关心任何事件，只是把channel绑定到selector上去。
+
+```
+register0 中
+                AbstractChannel.this.pipeline.invokeHandlerAddedIfNeeded();
+
+                AbstractChannel.this.pipeline.fireChannelRegistered();
+对应的是用户代码ServerHandler中的回调方法：
+handlerAdded()和channelRegistered()
+
+```
+
+## 端口绑定
+
+![image-20210227160409694](image-20210227160409694.png)
+
+readIfIsAutoRead方法：将之前注册到seclect上的事件重新绑定为accept事件，
+
+这样有新连接进来selector就会轮询到new accept事件。最终将这个连接交给netty处理。
+
+```
+private static void doBind0(final ChannelFuture regFuture, final Channel channel, final SocketAddress localAddress, final ChannelPromise promise) {
+    channel.eventLoop().execute(new Runnable() {
+        public void run() {
+            if (regFuture.isSuccess()) {
+                channel.bind(localAddress, promise).addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
+            } else {
+                promise.setFailure(regFuture.cause());
+            }
+
+        }
+    });
+}
+```
+
+最终到 NioServerSocketChannel
+
+```
+protected void doBind(SocketAddress localAddress) throws Exception {
+    if (PlatformDependent.javaVersion() >= 7) {
+        this.javaChannel().bind(localAddress, this.config.getBacklog());
+    } else {
+        this.javaChannel().socket().bind(localAddress, this.config.getBacklog());
+    }
+
+}
+```
+
+绑定成功之后进入DefaultChannelPipeline
+
+```
+public void channelActive(ChannelHandlerContext ctx) {
+    ctx.fireChannelActive();//传递事件
+    this.readIfIsAutoRead();
+}
+
+ public Channel read() {
+        this.pipeline.read();
+        return this;
+    }
+    
+    AbstractChannelHandlerContext
+    
+ public ChannelHandlerContext read() {
+        AbstractChannelHandlerContext next = this.findContextOutbound(16384);
+        EventExecutor executor = next.executor();
+        if (executor.inEventLoop()) {
+            next.invokeRead();
+        } else {
+            AbstractChannelHandlerContext.Tasks tasks = next.invokeTasks;
+            if (tasks == null) {
+                next.invokeTasks = tasks = new AbstractChannelHandlerContext.Tasks(next);
+            }
+
+            executor.execute(tasks.invokeReadTask);
+        }
+
+        return this;
+    }
+    
+    后面会传递到 AbstractChannel中的beginRead方法
+    
+    public final void beginRead() {
+            this.assertEventLoop();
+            if (AbstractChannel.this.isActive()) {
+                try {
+                    AbstractChannel.this.doBeginRead();
+                } catch (final Exception var2) {
+                    this.invokeLater(new Runnable() {
+                        public void run() {
+                            AbstractChannel.this.pipeline.fireExceptionCaught(var2);
+                        }
+                    });
+                    this.close(this.voidPromise());
+                }
+
+            }
+        }
+        
+        熟悉的Java操作
+ protected void doBeginRead() throws Exception {
+        SelectionKey selectionKey = this.selectionKey;
+        if (selectionKey.isValid()) {
+            this.readPending = true;
+            int interestOps = selectionKey.interestOps();
+//            interestOps之前用的是0，所以会进入
+            if ((interestOps & this.readInterestOp) == 0) {
+            //或 相当于增加了一个选项
+                selectionKey.interestOps(interestOps | this.readInterestOp);
+            }
+
+        }
+    }
+        
+```
+
+这里readinterstop 就是在nioserver构造时保存的
+
+![image-20210227163441335](image-20210227163441335.png)
+
+总结：当端口完成绑定之后，会触发一个active事件，这个active事件会调用到channel的一个read事件，服务端的read事件相当于读一个新的连接。
+
+![image-20210227165029807](image-20210227165029807.png)
+
+## NioEventLoop
+
+**问题：默认情况下，netty服务端起多少个线程？何时启动?**
+
+**问题：netty是如何解决jdk空轮询bug的？**
+
+**问题：netty是如何保证异步串行无锁化？**
+
+
+
+
+
+### 创建
+
+![image-20210227165649180](image-20210227165649180.png)
+
+一直跟进NioEventLoopGroup的构造方法到MultithreadEventLoopGroup类中的
+
+```
+private static final int DEFAULT_EVENT_LOOP_THREADS = Math.max(1, SystemPropertyUtil.getInt("io.netty.eventLoopThreads", NettyRuntime.availableProcessors() * 2));
+
+protected MultithreadEventLoopGroup(int nThreads, Executor executor, Object... args) {
+    super(nThreads == 0 ? DEFAULT_EVENT_LOOP_THREADS : nThreads, executor, args);
+}
+```
+
+```
+protected MultithreadEventExecutorGroup(int nThreads, Executor executor, EventExecutorChooserFactory chooserFactory, Object... args) {
+    this.terminatedChildren = new AtomicInteger();
+    this.terminationFuture = new DefaultPromise(GlobalEventExecutor.INSTANCE);
+    if (nThreads <= 0) {
+        throw new IllegalArgumentException(String.format("nThreads: %d (expected: > 0)", nThreads));
+    } else {
+        if (executor == null) {
+        //创建线程选择器
+            executor = new ThreadPerTaskExecutor(this.newDefaultThreadFactory());
+        }
+
+        this.children = new EventExecutor[nThreads];
+
+        int j;
+        for(int i = 0; i < nThreads; ++i) {
+            boolean success = false;
+            boolean var18 = false;
+
+            try {
+                var18 = true;
+                //创建NioEventLooper
+                
+                this.children[i] = this.newChild((Executor)executor, args);
+                success = true;
+                var18 = false;
+            } catch (Exception var19) {
+                throw new IllegalStateException("failed to create a child event loop", var19);
+            } finally {
+                if (var18) {
+                    if (!success) {
+                        int j;
+                        for(j = 0; j < i; ++j) {
+                            this.children[j].shutdownGracefully();
+                        }
+
+                        for(j = 0; j < i; ++j) {
+                            EventExecutor e = this.children[j];
+
+                            try {
+                                while(!e.isTerminated()) {
+                                    e.awaitTermination(2147483647L, TimeUnit.SECONDS);
+                                }
+                            } catch (InterruptedException var20) {
+                                Thread.currentThread().interrupt();
+                                break;
+                            }
+                        }
+                    }
+
+                }
+            }
+
+            if (!success) {
+                for(j = 0; j < i; ++j) {
+                    this.children[j].shutdownGracefully();
+                }
+
+                for(j = 0; j < i; ++j) {
+                    EventExecutor e = this.children[j];
+
+                    try {
+                        while(!e.isTerminated()) {
+                            e.awaitTermination(2147483647L, TimeUnit.SECONDS);
+                        }
+                    } catch (InterruptedException var22) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }
+		//创建选择器
+        this.chooser = chooserFactory.newChooser(this.children);
+        FutureListener<Object> terminationListener = new FutureListener<Object>() {
+            public void operationComplete(Future<Object> future) throws Exception {
+                if (MultithreadEventExecutorGroup.this.terminatedChildren.incrementAndGet() == MultithreadEventExecutorGroup.this.children.length) {
+                    MultithreadEventExecutorGroup.this.terminationFuture.setSuccess((Object)null);
+                }
+
+            }
+        };
+        EventExecutor[] var24 = this.children;
+        j = var24.length;
+
+        for(int var26 = 0; var26 < j; ++var26) {
+            EventExecutor e = var24[var26];
+            e.terminationFuture().addListener(terminationListener);
+        }
+
+        Set<EventExecutor> childrenSet = new LinkedHashSet(this.children.length);
+        Collections.addAll(childrenSet, this.children);
+        this.readonlyChildren = Collections.unmodifiableSet(childrenSet);
+    }
+}
+```
+
+
+
+#### ThreadPerTaskExecutor
+
+1，每次执行任务都会创建一个线程实体
+
+```
+public final class ThreadPerTaskExecutor implements Executor {
+    private final ThreadFactory threadFactory;
+
+    public ThreadPerTaskExecutor(ThreadFactory threadFactory) {
+        this.threadFactory = (ThreadFactory)ObjectUtil.checkNotNull(threadFactory, "threadFactory");
+    }
+
+    public void execute(Runnable command) {
+        this.threadFactory.newThread(command).start();
+    }
+}
+```
+
+2，NioEventLoop线程命名规则 nioEventLoop-1-xx
+
+```
+public DefaultThreadFactory(Class<?> poolType, boolean daemon, int priority) {
+    this(toPoolName(poolType), daemon, priority);
+}
+```
+
+```
+public static String toPoolName(Class<?> poolType) {
+    ObjectUtil.checkNotNull(poolType, "poolType");
+    String poolName = StringUtil.simpleClassName(poolType);
+    switch(poolName.length()) {
+    case 0:
+        return "unknown";
+    case 1:
+        return poolName.toLowerCase(Locale.US);
+    default:
+        return Character.isUpperCase(poolName.charAt(0)) && Character.isLowerCase(poolName.charAt(1)) ? Character.toLowerCase(poolName.charAt(0)) + poolName.substring(1) : poolName;
+    }
+}
+```
+
+```
+public DefaultThreadFactory(String poolName, boolean daemon, int priority, ThreadGroup threadGroup) {
+    this.nextId = new AtomicInteger();
+    ObjectUtil.checkNotNull(poolName, "poolName");
+    if (priority >= 1 && priority <= 10) {
+        this.prefix = poolName + '-' + poolId.incrementAndGet() + '-';
+        this.daemon = daemon;
+        this.priority = priority;
+        this.threadGroup = threadGroup;
+    } else {
+        throw new IllegalArgumentException("priority: " + priority + " (expected: Thread.MIN_PRIORITY <= priority <= Thread.MAX_PRIORITY)");
+    }
+}
+```
+
+```
+public Thread newThread(Runnable r) {
+    Thread t = this.newThread(FastThreadLocalRunnable.wrap(r), this.prefix + this.nextId.incrementAndGet());
+
+    try {
+        if (t.isDaemon() != this.daemon) {
+            t.setDaemon(this.daemon);
+        }
+
+        if (t.getPriority() != this.priority) {
+            t.setPriority(this.priority);
+        }
+    } catch (Exception var4) {
+    }
+
+    return t;
+}
+```
+
+```
+protected Thread newThread(Runnable r, String name) {
+    return new FastThreadLocalThread(this.threadGroup, r, name);
+}
+
+FastThreadLocalThread extends Thread
+
+```
+
+
+
+#### newchild()
+
+1，保存线程执行器ThreadPerTaskExecutor
+
+2，创建一个MpscQueue
+
+3，创建一个selector
+
+
+
+```
+protected EventLoop newChild(Executor executor, Object... args) throws Exception {
+    EventLoopTaskQueueFactory queueFactory = args.length == 4 ? (EventLoopTaskQueueFactory)args[3] : null;
+    return new NioEventLoop(this, executor, (SelectorProvider)args[0], ((SelectStrategyFactory)args[1]).newSelectStrategy(), (RejectedExecutionHandler)args[2], queueFactory);
+}
+```
+
+```
+NioEventLoop.SelectorTuple selectorTuple = this.openSelector();
+```
+
+chooserFactory.newChooser()
+
+chooser的作用是给新连接绑定nioeventlooper
+
+对应的是
+
+```
+public EventExecutor next() {
+    return this.chooser.next();
+}
+```
+
+![image-20210227175057572](image-20210227175057572.png)
+
+第一个连接进来使用第一个NioEventLoop绑定，第n个连接进来使用第n个NioEventLoop绑定...第n+1个连接进来使用第n+1个NioEventLoop绑定。
+
+![image-20210227175539549](image-20210227175539549.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### 启动
+
+#### NioEventLoop启动触发器
+
+1，服务端启动绑定端口
+
+![image-20210227175851348](image-20210227175851348.png)
+
+```
+private static void doBind0(final ChannelFuture regFuture, final Channel channel, final SocketAddress localAddress, final ChannelPromise promise) {
+    channel.eventLoop().execute(new Runnable() {
+        public void run() {
+            if (regFuture.isSuccess()) {
+                channel.bind(localAddress, promise).addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
+            } else {
+                promise.setFailure(regFuture.cause());
+            }
+
+        }
+    });
+}
+```
+
+这里的 eventLoop方法就是服务端启动的时候register上去的。
+
+SingleThreadEventExecutor 
+
+```
+public void execute(Runnable task) {
+    ObjectUtil.checkNotNull(task, "task");
+    this.execute(task, !(task instanceof LazyRunnable) && this.wakesUpForTask(task));
+}
+```
+
+```
+private void execute(Runnable task, boolean immediate) {
+    boolean inEventLoop = this.inEventLoop();
+    this.addTask(task);
+    if (!inEventLoop) {
+        this.startThread();
+        if (this.isShutdown()) {
+            boolean reject = false;
+
+            try {
+                if (this.removeTask(task)) {
+                    reject = true;
+                }
+            } catch (UnsupportedOperationException var6) {
+            }
+
+            if (reject) {
+                reject();
+            }
+        }
+    }
+
+    if (!this.addTaskWakesUp && immediate) {
+        this.wakeup(inEventLoop);
+    }
+
+}
+```
+
+
+
+
+
+
+
+2，新连接接入通过chooser绑定要给NioEventLoop
+
+
+
+
+
+
+
+
+
+### 执行逻辑
+
+NioEventLoop执行：SingleThreadEventExecutor.this.run();
+
+![image-20210227181652645](image-20210227181652645.png)
+
+NioEventLoop的run方法
+
+```
+@Override
+protected void run() {
+    int selectCnt = 0;
+    for (;;) {
+        try {
+            int strategy;
+            try {
+                strategy = selectStrategy.calculateStrategy(selectNowSupplier, hasTasks());
+                switch (strategy) {
+                case SelectStrategy.CONTINUE:
+                    continue;
+
+                case SelectStrategy.BUSY_WAIT:
+                    // fall-through to SELECT since the busy-wait is not supported with NIO
+
+                case SelectStrategy.SELECT:
+                    long curDeadlineNanos = nextScheduledTaskDeadlineNanos();
+                    if (curDeadlineNanos == -1L) {
+                        curDeadlineNanos = NONE; // nothing on the calendar
+                    }
+                    nextWakeupNanos.set(curDeadlineNanos);
+                    try {
+                        if (!hasTasks()) {
+                            strategy = select(curDeadlineNanos);
+                        }
+                    } finally {
+                        // This update is just to help block unnecessary selector wakeups
+                        // so use of lazySet is ok (no race condition)
+                        nextWakeupNanos.lazySet(AWAKE);
+                    }
+                    // fall through
+                default:
+                }
+            } catch (IOException e) {
+                // If we receive an IOException here its because the Selector is messed up. Let's rebuild
+                // the selector and retry. https://github.com/netty/netty/issues/8566
+                rebuildSelector0();
+                selectCnt = 0;
+                handleLoopException(e);
+                continue;
+            }
+
+            selectCnt++;
+            cancelledKeys = 0;
+            needsToSelectAgain = false;
+            final int ioRatio = this.ioRatio;
+            boolean ranTasks;
+            if (ioRatio == 100) {
+                try {
+                    if (strategy > 0) {
+                        processSelectedKeys();
+                    }
+                } finally {
+                    // Ensure we always run tasks.
+                    ranTasks = runAllTasks();
+                }
+            } else if (strategy > 0) {
+                final long ioStartTime = System.nanoTime();
+                try {
+                    processSelectedKeys();
+                } finally {
+                    // Ensure we always run tasks.
+                    final long ioTime = System.nanoTime() - ioStartTime;
+                    ranTasks = runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
+                }
+            } else {
+                ranTasks = runAllTasks(0); // This will run the minimum number of tasks
+            }
+
+            if (ranTasks || strategy > 0) {
+                if (selectCnt > MIN_PREMATURE_SELECTOR_RETURNS && logger.isDebugEnabled()) {
+                    logger.debug("Selector.select() returned prematurely {} times in a row for Selector {}.",
+                            selectCnt - 1, selector);
+                }
+                selectCnt = 0;
+            } else if (unexpectedSelectorWakeup(selectCnt)) { // Unexpected wakeup (unusual case)
+                selectCnt = 0;
+            }
+        } catch (CancelledKeyException e) {
+            // Harmless exception - log anyway
+            if (logger.isDebugEnabled()) {
+                logger.debug(CancelledKeyException.class.getSimpleName() + " raised by a Selector {} - JDK bug?",
+                        selector, e);
+            }
+        } catch (Error e) {
+            throw (Error) e;
+        } catch (Throwable t) {
+            handleLoopException(t);
+        } finally {
+            // Always handle shutdown even if the loop processing threw an exception.
+            try {
+                if (isShuttingDown()) {
+                    closeAll();
+                    if (confirmShutdown()) {
+                        return;
+                    }
+                }
+            } catch (Error e) {
+                throw (Error) e;
+            } catch (Throwable t) {
+                handleLoopException(t);
+            }
+        }
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
