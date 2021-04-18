@@ -442,7 +442,26 @@ public class MainActivity extends AppCompatActivity {
 
 
 
+```
+private static class SafeHandler extends Handler {
 
+    private WeakReference<Test1> ref;
+
+    public SafeHandler(Test1 activity) {
+        this.ref = new WeakReference(activity);
+    }
+
+    @Override
+    public void handleMessage(final Message msg) {
+        Test1 activity = ref.get();
+        if (activity != null) {
+            activity.handleMessage(msg);
+        }
+    }
+}
+
+void handleMessage(Message msg){}
+```
 
 
 
