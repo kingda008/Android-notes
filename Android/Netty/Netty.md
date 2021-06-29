@@ -8,6 +8,139 @@ netty是什么
 
 ![image-20210215155141979](image-20210215155141979.png)
 
+普通写法：
+
+```java
+public class Server {
+
+    private ServerSocket serverSocket;
+
+    public Server(int port) {
+        try {
+            this.serverSocket = new ServerSocket(port);
+            System.out.println("服务端启动成功，端口:" + port);
+        } catch (IOException exception) {
+            System.out.println("服务端启动失败");
+        }
+    }
+
+    public void start() {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                doStart();
+            }
+        }).start();
+    }
+
+    private void doStart() {
+        while (true) {
+            try {
+                Socket client = serverSocket.accept();
+                new ClientHandler(client).start();
+            } catch (IOException e) {
+                System.out.println("服务端异常");
+            }
+        }
+    }
+}
+```
+
+```java
+public class ClientHandler {
+
+    public static final int MAX_DATA_LEN = 1024;
+    private final Socket socket;
+
+    public ClientHandler(Socket socket) {
+        this.socket = socket;
+    }
+
+    public void start() {
+        System.out.println("新客户端接入");
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                doStart();
+            }
+        }).start();
+    }
+
+    private void doStart() {
+        try {
+            InputStream inputStream = socket.getInputStream();
+            while (true) {
+                byte[] data = new byte[MAX_DATA_LEN];
+                int len;
+                while ((len = inputStream.read(data)) != -1) {
+                    String message = new String(data, 0, len);
+                    System.out.println("客户端传来消息: " + message);
+                    socket.getOutputStream().write(data);
+                }
+
+            }
+
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
+```java
+public class ServerBoot {
+
+    private static final int PORT = 8000;
+
+    public static void main(String[] args) {
+        Server server = new Server(PORT);
+        server.start();
+    }
+
+}
+```
+
+```java
+public class Client {
+    private static final String HOST = "127.0.0.1";
+    private static final int PORT = 8000;
+    private static final int SLEEP_TIME = 5000;
+
+    public static void main(String[] args) throws IOException {
+        final Socket socket = new Socket(HOST, PORT);
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                System.out.println("客户端启动成功!");
+                while (true) {
+                    try {
+                        String message = "hello world";
+                        System.out.println("客户端发送数据: " + message);
+                        socket.getOutputStream().write(message.getBytes());
+                    } catch (Exception e) {
+                        System.out.println("写数据出错!");
+                    }
+                    sleep();
+                }
+
+
+            }
+        }).start();
+
+    }
+
+    private static void sleep() {
+        try {
+            Thread.sleep(SLEEP_TIME);
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+
 
 
 ![image-20210215161616696](image-20210215161616696.png)
@@ -20,7 +153,7 @@ netty是什么
 
 
 
-## NioEventLoop 对应 Thread
+## NioEventLoop 对应 Thread，并监听连接
 
 ```
   @Override
@@ -43,13 +176,7 @@ ChannelHandler 对应逻辑处理块
 
 
 
-
-
-#### channel的创建
-
-**问题：服务端socket在哪里初始化？**
-
-**问题：在哪里accept连接**
+# 服务端
 
 
 
@@ -57,19 +184,103 @@ ChannelHandler 对应逻辑处理块
 
 
 
-创建服务端channel
+## channel的创建
+
+### **问题：服务端socket在哪里初始化？**
+
+### **问题：在哪里accept连接**
+
+demo
+
+```java
+        EventLoopGroup bossGroup = new NioEventLoopGroup(1);
+        EventLoopGroup workerGroup = new NioEventLoopGroup();
+
+        try {
+            ServerBootstrap b = new ServerBootstrap();
+            b.group(bossGroup, workerGroup)
+                    .channel(NioServerSocketChannel.class)
+                    .childOption(ChannelOption.TCP_NODELAY, true)
+                    .childAttr(AttributeKey.newInstance("childAttr"), "childAttrValue")
+                    .handler(new ServerHandler())
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        public void initChannel(SocketChannel ch) {
+//                            ch.pipeline().addLast(new AuthHandler());
+
+
+                        }
+                    });
+
+            ChannelFuture f = b.bind(8888).sync();
+
+            f.channel().closeFuture().sync();
+        } finally {
+            bossGroup.shutdownGracefully();
+            workerGroup.shutdownGracefully();
+        }
+```
 
 
 
-初始化服务端channel
+```java
+public class ServerHandler extends ChannelInboundHandlerAdapter {
+    @Override
+    public void channelActive(ChannelHandlerContext ctx) {
+        System.out.println("channelActive");
+    }
+
+    @Override
+    public void channelRegistered(ChannelHandlerContext ctx) {
+        System.out.println("channelRegistered");
+    }
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        System.out.println("handlerAdded");
+    }
+
+    @Override
+    public void channelRead(final ChannelHandlerContext ctx, Object msg) throws Exception {
+        super.channelRead(ctx, msg);
+
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                // 耗时的操作
+                String result = loadFromDB();
+
+                ctx.channel().writeAndFlush(result);
+                ctx.executor().schedule(new Runnable() {
+                    @Override
+                    public void run() {
+                        // ...
+                    }
+                }, 1, TimeUnit.SECONDS);
+
+            }
+        }).start();
+    }
+
+    private String loadFromDB() {
+        return "hello world!";
+    }
+}
+```
+
+### 步骤1：创建服务端channel
 
 
 
-注册selector
+### 步骤2：初始化服务端channel
 
 
 
-端口绑定
+### 步骤3：注册selector
+
+
+
+## 步骤4：端口绑定
 
 ![image-20210217162146720](image-20210217162146720.png)
 
@@ -635,7 +846,7 @@ protected MultithreadEventLoopGroup(int nThreads, Executor executor, Object... a
 }
 ```
 
-```
+```java
 protected MultithreadEventExecutorGroup(int nThreads, Executor executor, EventExecutorChooserFactory chooserFactory, Object... args) {
     this.terminatedChildren = new AtomicInteger();
     this.terminationFuture = new DefaultPromise(GlobalEventExecutor.INSTANCE);
